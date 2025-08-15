@@ -13,6 +13,11 @@ use windows::{
     Win32::System::Time::FileTimeToSystemTime,
     Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL},
     Win32::UI::Controls::*,
+    Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        GetDpiForWindow,
+        SetProcessDpiAwarenessContext,
+    },
     Win32::UI::Input::KeyboardAndMouse::SetFocus,
     Win32::UI::Shell::{
         ShellExecuteW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
@@ -85,6 +90,10 @@ pub struct AppState {
     pub mi_button_hwnd: HWND,
     pub himagelist: HIMAGELIST,
 
+    // --- DPI関連 ---
+    pub current_dpi: u32,
+    pub scale_factor: f32,
+
     // --- 検索オプション ---
     pub regex_enabled: bool,
     pub migemo_enabled: bool,
@@ -110,6 +119,8 @@ impl AppState {
             re_button_hwnd: HWND::default(),
             mi_button_hwnd: HWND::default(),
             himagelist: HIMAGELIST::default(),
+            current_dpi: 96,  // デフォルトDPI
+            scale_factor: 1.0,  // デフォルトスケール
             regex_enabled: false,
             migemo_enabled: false,
             migemo_dict,
@@ -123,6 +134,12 @@ impl AppState {
 
 /// アプリケーションのエントリポイント
 fn main() -> Result<()> {
+    // DPI対応を有効にする
+    unsafe {
+        // プロセス全体でDPI認識を設定
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     // アプリケーションの状態を初期化
     let app_state = AppState::new();
 
@@ -135,7 +152,7 @@ fn main() -> Result<()> {
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hInstance: instance.into(),
             lpszClassName: w!("window"),
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hIcon: icon,
             ..Default::default()
@@ -202,6 +219,7 @@ pub extern "system" fn wndproc(
         WM_NOTIFY => handle_notify(window, lparam, state.unwrap()),
         WM_SIZE => handle_size(window, lparam, state.unwrap()),
         WM_SETFOCUS => handle_setfocus(state.unwrap()),
+        WM_DPICHANGED => handle_dpi_changed(window, wparam, lparam, state.unwrap()),
         WM_PAINT => {
             let _ = unsafe { ValidateRect(Some(window), None) };
             LRESULT(0)
@@ -226,6 +244,12 @@ fn handle_create(window: HWND, lparam: LPARAM) -> LRESULT {
     // AppStateへのミュータブルな参照を取得
     let state = unsafe { &mut *app_state_ptr };
     state.main_hwnd = window;
+
+    // DPIを初期化
+    unsafe {
+        state.current_dpi = GetDpiForWindow(window);
+        state.scale_factor = state.current_dpi as f32 / 96.0;
+    }
 
     // UIコントロールの作成
     create_menu(window);
@@ -386,6 +410,39 @@ fn handle_setfocus(state: &AppState) -> LRESULT {
     LRESULT(0)
 }
 
+/// WM_DPICHANGED メッセージのハンドラ
+fn handle_dpi_changed(window: HWND, wparam: WPARAM, lparam: LPARAM, state: &mut AppState) -> LRESULT {
+    // 新しいDPIを取得
+    let new_dpi = hiword(wparam.0 as u32) as u32;
+    
+    // スケールファクターを計算
+    state.current_dpi = new_dpi;
+    state.scale_factor = new_dpi as f32 / 96.0;
+    
+    // 推奨ウィンドウサイズと位置を取得
+    let suggested_rect = unsafe { &*(lparam.0 as *const RECT) };
+    
+    // ウィンドウサイズと位置を更新
+    unsafe {
+        let _ = SetWindowPos(
+            window,
+            None,
+            suggested_rect.left,
+            suggested_rect.top,
+            suggested_rect.right - suggested_rect.left,
+            suggested_rect.bottom - suggested_rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    
+    // UIを再描画
+    unsafe {
+        let _ = InvalidateRect(Some(window), None, true);
+    }
+    
+    LRESULT(0)
+}
+
 // --- イベントハンドラ (WM_NOTIFY) のためのヘルパー関数 ---
 
 fn handle_get_disp_info(lparam: LPARAM, state: &mut AppState) {
@@ -481,23 +538,25 @@ fn handle_custom_draw(lparam: LPARAM, state: &mut AppState) -> LRESULT {
                 if sub_item_index == 0 {
                     let icon_index = get_icon_index(&result.name, result.is_folder, state.himagelist);
                     if state.himagelist.0 != 0 {
+                        let icon_size = (16.0 * state.scale_factor) as i32;
+                        let icon_padding = (2.0 * state.scale_factor) as i32;
                         let _ = unsafe {
                             ImageList_Draw(
                                 state.himagelist,
                                 icon_index,
                                 hdc,
-                                rect.left + 2,
-                                rect.top + (rect.bottom - rect.top - 16) / 2, // 中央揃え
+                                rect.left + icon_padding,
+                                rect.top + (rect.bottom - rect.top - icon_size) / 2, // 中央揃え
                                 ILD_TRANSPARENT,
                             )
                         };
                     }
                     // アイコンの分だけ描画開始位置をずらす
-                    rect.left += 22;
+                    rect.left += (22.0 * state.scale_factor) as i32;
                 } else {
-                    rect.left += 4; // パディング
+                    rect.left += (4.0 * state.scale_factor) as i32; // パディング
                 }
-                rect.right -= 4;
+                rect.right -= (4.0 * state.scale_factor) as i32;
 
                 // 3. テキストとハイライトを描画
                 let text_color = if is_selected {
@@ -511,30 +570,70 @@ fn handle_custom_draw(lparam: LPARAM, state: &mut AppState) -> LRESULT {
                 }
 
                 let mut x = rect.left;
-                let y = rect.top + (rect.bottom - rect.top) / 2 - 8;
+                let font_offset = (8.0 * state.scale_factor) as i32;
+                let y = rect.top + (rect.bottom - rect.top) / 2 - font_offset;
                 let chars: Vec<char> = text_to_draw.chars().collect();
-                let mut char_idx = 0;
-
-                for ch in chars {
-                    let s = ch.to_string();
-                    let s_wide = str_to_wide(&s);
+                
+                // 全テキストの文字位置を事前に計算
+                let full_text_wide = str_to_wide(&text_to_draw);
+                let mut char_widths = vec![0i32; chars.len()];
+                if chars.len() > 0 && full_text_wide.len() > 1 {
+                    let mut fit_count = 0i32;
                     let mut size = SIZE::default();
-                    let _ = unsafe { GetTextExtentPoint32W(hdc, &s_wide, &mut size) };
-
-                    let is_highlighted = highlight_ranges.iter().any(|(start, end)| char_idx >= *start && char_idx < *end);
-
-                    if is_highlighted && !is_selected {
+                    let _ = unsafe {
+                        GetTextExtentExPointW(
+                            hdc,
+                            PCWSTR(full_text_wide.as_ptr()),
+                            (full_text_wide.len() - 1) as i32, // null終端を除く長さ
+                            rect.right - rect.left,
+                            Some(&mut fit_count),
+                            Some(char_widths.as_mut_ptr()),
+                            &mut size,
+                        )
+                    };
+                }
+                
+                // 文字をグループ化して連続描画
+                let mut current_pos = 0;
+                while current_pos < chars.len() {
+                    // 現在の位置からハイライト状態が同じ範囲を見つける
+                    let is_current_highlighted = highlight_ranges.iter().any(|(start, end)| current_pos >= *start && current_pos < *end);
+                    let mut end_pos = current_pos + 1;
+                    
+                    // 同じハイライト状態の文字が続く限り範囲を拡張
+                    while end_pos < chars.len() {
+                        let is_next_highlighted = highlight_ranges.iter().any(|(start, end)| end_pos >= *start && end_pos < *end);
+                        if is_current_highlighted == is_next_highlighted {
+                            end_pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    // この範囲のテキストを取得
+                    let text_segment: String = chars[current_pos..end_pos].iter().collect();
+                    let text_wide = str_to_wide(&text_segment);
+                    
+                    // 正確な幅を計算（前の文字位置からの差分）
+                    let start_x = if current_pos == 0 { 0 } else { char_widths[current_pos - 1] };
+                    let end_x = if end_pos > 0 { char_widths[end_pos - 1] } else { 0 };
+                    let segment_width = end_x - start_x;
+                    
+                    // 描画範囲チェック
+                    if x + segment_width > rect.right { break; }
+                    
+                    // ハイライト背景を描画
+                    if is_current_highlighted && !is_selected {
                         let highlight_brush = unsafe { CreateSolidBrush(COLORREF(0x00FFFF)) }; // 黄色
-                        let highlight_rect = RECT { left: x, top: rect.top, right: x + size.cx, bottom: rect.bottom };
+                        let highlight_rect = RECT { left: x, top: rect.top, right: x + segment_width, bottom: rect.bottom };
                         unsafe { FillRect(hdc, &highlight_rect, highlight_brush) };
                         let _ = unsafe { DeleteObject(highlight_brush.into()) };
                     }
-
-                    if x + size.cx > rect.right { break; }
-
-                    let _ = unsafe { TextOutW(hdc, x, y, &s_wide) };
-                    x += size.cx;
-                    char_idx += 1;
+                    
+                    // テキストを描画
+                    let _ = unsafe { TextOutW(hdc, x, y, &text_wide) };
+                    x += segment_width;
+                    current_pos = end_pos;
                 }
 
                 // デフォルト描画をスキップ
@@ -598,9 +697,31 @@ fn create_menu(window: HWND) {
     }
 }
 
-/// すべてのUIコントロールを作成する
+/// すべてのUIコントロールを作成する（DPI対応）
 fn create_controls(window: HWND, instance: HINSTANCE, state: &mut AppState) {
-    let h_font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+    // DPIに基づいてフォントサイズを調整
+    let scale = state.scale_factor;
+    let font_height = (-12.0 * scale) as i32; // 負の値でピクセル単位指定
+    
+    let h_font = unsafe {
+        CreateFontW(
+            font_height,       // nHeight
+            0,                 // nWidth
+            0,                 // nEscapement
+            0,                 // nOrientation
+            FW_NORMAL.0 as i32,// nWeight
+            0,                 // bItalic
+            0,                 // bUnderline
+            0,                 // bStrikeOut
+            DEFAULT_CHARSET,   // nCharSet
+            OUT_DEFAULT_PRECIS, // nOutPrecision
+            CLIP_DEFAULT_PRECIS, // nClipPrecision
+            DEFAULT_QUALITY,   // nQuality
+            (FF_DONTCARE.0 | VARIABLE_PITCH.0) as u32, // nPitchAndFamily
+            w!("Segoe UI"),    // lpszFacename
+        )
+    };
+
     unsafe {
         state.status_hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(), w!("STATIC"), w!("Ready"),
@@ -630,15 +751,17 @@ fn create_controls(window: HWND, instance: HINSTANCE, state: &mut AppState) {
         ).unwrap();
 
         // フォント設定
-        SendMessageW(state.status_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
-        SendMessageW(state.edit_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
-        SendMessageW(state.re_button_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
-        SendMessageW(state.mi_button_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
-        SendMessageW(state.listview_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
+        if !h_font.is_invalid() {
+            SendMessageW(state.status_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
+            SendMessageW(state.edit_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
+            SendMessageW(state.re_button_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
+            SendMessageW(state.mi_button_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
+            SendMessageW(state.listview_hwnd, WM_SETFONT, Some(WPARAM(h_font.0 as usize)), Some(LPARAM(1)));
+        }
     }
 }
 
-/// リストビューの初期設定（カラム、拡張スタイル、イメージリスト）
+/// リストビューの初期設定（カラム、拡張スタイル、イメージリスト）（DPI対応）
 fn setup_listview(state: &mut AppState) {
     unsafe {
         let ex_style = LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES;
@@ -655,7 +778,15 @@ fn setup_listview(state: &mut AppState) {
             SendMessageW(state.listview_hwnd, LVM_SETIMAGELIST, Some(WPARAM(LVSIL_SMALL as usize)), Some(LPARAM(state.himagelist.0)));
         }
 
-        let columns = [ (w!("名前"), 300), (w!("フォルダー"), 300), (w!("サイズ"), 80), (w!("更新日時"), 150) ];
+        // DPIに基づいてカラム幅を調整
+        let scale = state.scale_factor;
+        let columns = [
+            (w!("名前"), (300.0 * scale) as i32),
+            (w!("フォルダー"), (300.0 * scale) as i32),
+            (w!("サイズ"), (80.0 * scale) as i32),
+            (w!("更新日時"), (150.0 * scale) as i32)
+        ];
+        
         for (i, (text, width)) in columns.iter().enumerate() {
             let mut col = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH,
@@ -688,11 +819,13 @@ fn update_ui_states(state: &AppState) {
     }
 }
 
-/// ウィンドウリサイズ時にコントロールを再配置する
+/// ウィンドウリサイズ時にコントロールを再配置する（DPI対応）
 fn layout_controls(width: i32, height: i32, state: &AppState) {
-    let bar_height = 25;
-    let status_bar_height = 20;
-    let button_width = 40;
+    // DPIに基づいてサイズを調整
+    let scale = state.scale_factor;
+    let bar_height = (25.0 * scale) as i32;
+    let status_bar_height = (20.0 * scale) as i32;
+    let button_width = (40.0 * scale) as i32;
     let total_button_width = button_width * 2;
     let list_y = bar_height;
 
