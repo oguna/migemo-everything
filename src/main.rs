@@ -466,6 +466,11 @@ fn handle_get_disp_info(lparam: LPARAM, state: &mut AppState) {
     let item = &mut dispinfo.item;
     let item_index = item.iItem as usize;
 
+    // アイテムインデックスが有効範囲内かチェック
+    if item_index >= state.total_results as usize {
+        return;
+    }
+
     // 必要に応じてデータを読み込む
     ensure_data_available(state, item_index);
 
@@ -500,8 +505,8 @@ fn handle_get_disp_info(lparam: LPARAM, state: &mut AppState) {
             state.item_wide_buffer[sub_item_index] = str_to_wide(&text);
             item.pszText = PWSTR(state.item_wide_buffer[sub_item_index].as_mut_ptr());
         }
-        // アイコン情報
-        if item.iSubItem == 0 && (item.mask & LVIF_IMAGE) == LVIF_IMAGE {
+        // アイコン情報（1列目かつ有効なデータの場合のみ）
+        if item.iSubItem == 0 && (item.mask & LVIF_IMAGE) == LVIF_IMAGE && !result.name.is_empty() {
             item.iImage = get_icon_index(&result.name, result.is_folder, state.himagelist);
         }
     }
@@ -522,6 +527,11 @@ fn handle_custom_draw(lparam: LPARAM, state: &mut AppState) -> LRESULT {
         stage if stage.0 == (CDDS_SUBITEM.0 | CDDS_ITEMPREPAINT.0) => {
             let item_index = custom_draw.nmcd.dwItemSpec as usize;
             let sub_item_index = custom_draw.iSubItem as usize;
+
+            // ヘッダー行やアイテムインデックスが無効な場合はデフォルト描画
+            if item_index >= state.total_results as usize {
+                return LRESULT(CDRF_DODEFAULT as isize);
+            }
 
             // 必要に応じてデータを読み込む
             ensure_data_available(state, item_index);
@@ -564,22 +574,27 @@ fn handle_custom_draw(lparam: LPARAM, state: &mut AppState) -> LRESULT {
                 unsafe { FillRect(hdc, &rect, bg_brush) };
                 let _ = unsafe { DeleteObject(bg_brush.into()) };
 
-                // 2. アイコンを描画 (1列目のみ)
-                if sub_item_index == 0 {
+                // 2. アイコンを描画 (1列目のみ、かつデータが存在する場合のみ)
+                if sub_item_index == 0 && !result.name.is_empty() {
                     let icon_index = get_icon_index(&result.name, result.is_folder, state.himagelist);
-                    if state.himagelist.0 != 0 {
+                    if state.himagelist.0 != 0 && icon_index >= 0 {
                         let icon_size = (16.0 * state.scale_factor) as i32;
                         let icon_padding = (2.0 * state.scale_factor) as i32;
-                        let _ = unsafe {
-                            ImageList_Draw(
-                                state.himagelist,
-                                icon_index,
-                                hdc,
-                                rect.left + icon_padding,
-                                rect.top + (rect.bottom - rect.top - icon_size) / 2, // 中央揃え
-                                ILD_TRANSPARENT,
-                            )
-                        };
+                        let icon_y = rect.top + (rect.bottom - rect.top - icon_size) / 2;
+                        
+                        // アイコンがリスト項目の範囲内にあることを確認
+                        if icon_y >= rect.top && icon_y + icon_size <= rect.bottom {
+                            let _ = unsafe {
+                                ImageList_Draw(
+                                    state.himagelist,
+                                    icon_index,
+                                    hdc,
+                                    rect.left + icon_padding,
+                                    icon_y,
+                                    ILD_TRANSPARENT,
+                                )
+                            };
+                        }
                     }
                     // アイコンの分だけ描画開始位置をずらす
                     rect.left += (22.0 * state.scale_factor) as i32;
