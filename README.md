@@ -10,6 +10,8 @@ cargo build --release
 
 ## 実行方法
 実行ファイルと同じフォルダに、`Everything64.dll`と`migemo-compact-dict`があることを確認してください。
+`Everything64.dll`は、リリース用の配布ファイルに含まれています。
+`migemo-compact-dict`は、migemo-dictの[配布サイト](https://github.com/oguna/yet-another-migemo-dict)からダウンロードしてください。
 また、Everythingが実行中であることも確認してください。
 
 `migemo-everything.exe`を起動すると、画面が表示されます。
