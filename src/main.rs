@@ -1059,6 +1059,17 @@ fn perform_search(state: &mut AppState) {
     let len = unsafe { GetWindowTextW(state.edit_hwnd, &mut buffer) };
     let search_term = String::from_utf16_lossy(&buffer[..len as usize]);
 
+    // ウィンドウタイトルを更新
+    let window_title = if search_term.is_empty() {
+        "Migemo Everything".to_string()
+    } else {
+        format!("{} - Migemo Everything", search_term)
+    };
+    unsafe {
+        let title_wide = str_to_wide(&window_title);
+        let _ = SetWindowTextW(state.main_hwnd, PCWSTR(title_wide.as_ptr()));
+    }
+
     if search_term.is_empty() {
         state.search_results.lock().unwrap().clear();
         state.total_results = 0;
