@@ -622,6 +622,8 @@ fn handle_custom_draw(lparam: LPARAM, state: &mut AppState) -> LRESULT {
                 // 全テキストの文字位置を事前に計算
                 let full_text_wide = str_to_wide(&text_to_draw);
                 let mut char_widths = vec![0i32; chars.len()];
+                let mut max_fit_chars = chars.len();
+                
                 if chars.len() > 0 && full_text_wide.len() > 1 {
                     let mut fit_count = 0i32;
                     let mut size = SIZE::default();
@@ -636,17 +638,58 @@ fn handle_custom_draw(lparam: LPARAM, state: &mut AppState) -> LRESULT {
                             &mut size,
                         )
                     };
+                    max_fit_chars = fit_count as usize;
                 }
+                
+                // 省略記号の幅を事前に計算
+                let ellipsis = "...";
+                let ellipsis_wide = str_to_wide(ellipsis);
+                let ellipsis_width = unsafe {
+                    let mut size = SIZE::default();
+                    let _ = GetTextExtentPointW(hdc, &ellipsis_wide, &mut size);
+                    size.cx
+                };
+                
+                // テキストが切り詰められるかどうかを判定
+                let is_truncated = chars.len() > max_fit_chars;
+                
+                // 省略記号が必要な場合、最後に表示可能な文字数を再計算
+                let effective_max_chars = if is_truncated {
+                    // 省略記号の分だけ余裕を残した文字数を計算
+                    let available_width_for_text = rect.right - rect.left - ellipsis_width;
+                    if available_width_for_text > 0 {
+                        let mut truncated_fit_count = 0i32;
+                        let mut size = SIZE::default();
+                        let _ = unsafe {
+                            GetTextExtentExPointW(
+                                hdc,
+                                PCWSTR(full_text_wide.as_ptr()),
+                                (full_text_wide.len() - 1) as i32,
+                                available_width_for_text,
+                                Some(&mut truncated_fit_count),
+                                None,
+                                &mut size,
+                            )
+                        };
+                        std::cmp::min(truncated_fit_count as usize, max_fit_chars)
+                    } else {
+                        0
+                    }
+                } else {
+                    max_fit_chars
+                };
                 
                 // 文字をグループ化して連続描画
                 let mut current_pos = 0;
-                while current_pos < chars.len() {
+                let mut last_drawn_pos = 0;
+                
+                while current_pos < chars.len() && current_pos < effective_max_chars {
                     // 現在の位置からハイライト状態が同じ範囲を見つける
                     let is_current_highlighted = highlight_ranges.iter().any(|(start, end)| current_pos >= *start && current_pos < *end);
                     let mut end_pos = current_pos + 1;
                     
-                    // 同じハイライト状態の文字が続く限り範囲を拡張
-                    while end_pos < chars.len() {
+                    // 同じハイライト状態の文字が続く限り範囲を拡張（ただし有効な最大文字数まで）
+                    while end_pos < chars.len() && end_pos <= effective_max_chars {
                         let is_next_highlighted = highlight_ranges.iter().any(|(start, end)| end_pos >= *start && end_pos < *end);
                         if is_current_highlighted == is_next_highlighted {
                             end_pos += 1;
@@ -655,30 +698,80 @@ fn handle_custom_draw(lparam: LPARAM, state: &mut AppState) -> LRESULT {
                         }
                     }
                     
+                    // 有効文字数を超えないように制限
+                    end_pos = std::cmp::min(end_pos, effective_max_chars);
+                    
                     // この範囲のテキストを取得
                     let text_segment: String = chars[current_pos..end_pos].iter().collect();
                     let text_wide = str_to_wide(&text_segment);
                     
                     // 正確な幅を計算（前の文字位置からの差分）
                     let start_x = if current_pos == 0 { 0 } else { char_widths[current_pos - 1] };
-                    let end_x = if end_pos > 0 { char_widths[end_pos - 1] } else { 0 };
+                    let end_x = if end_pos > 0 && end_pos <= char_widths.len() { char_widths[end_pos - 1] } else { 0 };
                     let segment_width = end_x - start_x;
                     
-                    // 描画範囲チェック
-                    if x + segment_width > rect.right { break; }
+                    // 描画可能な実際の幅を計算（セル境界を考慮）
+                    let available_space = rect.right - x;
+                    let actual_segment_width = std::cmp::min(segment_width, available_space);
                     
-                    // ハイライト背景を描画
-                    if is_current_highlighted && !is_selected {
-                        let highlight_brush = unsafe { CreateSolidBrush(COLORREF(0x00FFFF)) }; // 黄色
-                        let highlight_rect = RECT { left: x, top: rect.top, right: x + segment_width, bottom: rect.bottom };
-                        unsafe { FillRect(hdc, &highlight_rect, highlight_brush) };
-                        let _ = unsafe { DeleteObject(highlight_brush.into()) };
+                    // セグメントが完全に描画できない場合は停止
+                    if actual_segment_width <= 0 || x >= rect.right {
+                        break;
                     }
                     
-                    // テキストを描画
-                    let _ = unsafe { TextOutW(hdc, x, y, &text_wide) };
-                    x += segment_width;
+                    // ハイライト背景を描画（セル境界を厳密に考慮）
+                    if is_current_highlighted && !is_selected {
+                        // ハイライト背景の描画範囲を計算（セル境界を超えないように制限）
+                        let highlight_left = x;
+                        let highlight_right = std::cmp::min(x + segment_width, rect.right);
+                        
+                        // 有効なハイライト幅がある場合のみ描画
+                        if highlight_right > highlight_left && highlight_left < rect.right {
+                            let highlight_brush = unsafe { CreateSolidBrush(COLORREF(0x00FFFF)) }; // 黄色
+                            let highlight_rect = RECT { 
+                                left: highlight_left, 
+                                top: rect.top, 
+                                right: highlight_right,
+                                bottom: rect.bottom 
+                            };
+                            unsafe { FillRect(hdc, &highlight_rect, highlight_brush) };
+                            let _ = unsafe { DeleteObject(highlight_brush.into()) };
+                        }
+                    }
+                    
+                    // テキストを描画（クリップ領域内のみ）
+                    unsafe {
+                        let clip_region = CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom);
+                        SelectClipRgn(hdc, Some(clip_region));
+                        
+                        let _ = TextOutW(hdc, x, y, &text_wide);
+                        
+                        SelectClipRgn(hdc, None);
+                        let _ = DeleteObject(clip_region.into());
+                    }
+                    
+                    // 描画位置を更新（セル境界を考慮）
+                    x += actual_segment_width;
                     current_pos = end_pos;
+                    last_drawn_pos = end_pos;
+                    
+                    // セルの右端に達した場合は描画を停止
+                    if x >= rect.right {
+                        break;
+                    }
+                }
+                
+                // 省略記号を描画（必要な場合）
+                if is_truncated && last_drawn_pos < chars.len() && x + ellipsis_width <= rect.right {
+                    unsafe {
+                        let clip_region = CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom);
+                        SelectClipRgn(hdc, Some(clip_region));
+                        
+                        let _ = TextOutW(hdc, x, y, &ellipsis_wide);
+                        
+                        SelectClipRgn(hdc, None);
+                        let _ = DeleteObject(clip_region.into());
+                    }
                 }
 
                 // デフォルト描画をスキップ
