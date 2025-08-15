@@ -57,6 +57,13 @@ const IDM_SEARCH_REGEX: u16 = 3001;
 /// メニューID: Migemo検索
 const IDM_SEARCH_MIGEMO: u16 = 3002;
 
+/// アクセラレータID: 終了
+const IDA_EXIT: u16 = 5001;
+/// アクセラレータID: 正規表現検索
+const IDA_REGEX: u16 = 5002;
+/// アクセラレータID: Migemo検索
+const IDA_MIGEMO: u16 = 5003;
+
 /// コンテキストメニューID: 開く
 const IDM_CONTEXT_OPEN: u16 = 4001;
 /// コンテキストメニューID: フォルダーを開く
@@ -173,7 +180,7 @@ fn main() -> Result<()> {
 
         // メインウィンドウの作成
         // ここで Box<AppState> を作成し、WM_CREATE でウィンドウに渡す
-        let _hwnd = CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("window"),
             w!("Migemo Everything"),
@@ -188,11 +195,33 @@ fn main() -> Result<()> {
             Some(Box::into_raw(Box::new(app_state)) as *const c_void), // AppStateを渡す
         )?;
 
+        // アクセラレータテーブルの作成
+        let accelerators = [
+            ACCEL {
+                fVirt: FCONTROL | FVIRTKEY,
+                key: b'Q' as u16,
+                cmd: IDA_EXIT,
+            },
+            ACCEL {
+                fVirt: FCONTROL | FVIRTKEY,
+                key: b'R' as u16,
+                cmd: IDA_REGEX,
+            },
+            ACCEL {
+                fVirt: FCONTROL | FSHIFT | FVIRTKEY,
+                key: b'R' as u16,
+                cmd: IDA_MIGEMO,
+            },
+        ];
+        let haccel = CreateAcceleratorTableW(&accelerators)?;
+
         // メッセージループ
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).into() {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+            if TranslateAcceleratorW(hwnd, haccel, &message) == 0 {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
     }
     Ok(())
@@ -294,6 +323,22 @@ fn handle_command(window: HWND, wparam: WPARAM, lparam: LPARAM, state: &mut AppS
     let notification_code = hiword(wparam.0 as u32);
 
     match control_id {
+        // --- アクセラレータ ---
+        IDA_EXIT => {
+            let _ = unsafe { DestroyWindow(window) };
+        }
+        IDA_REGEX => {
+            state.regex_enabled = !state.regex_enabled;
+            if state.regex_enabled { state.migemo_enabled = false; }
+            update_ui_states(state);
+            trigger_search(window);
+        }
+        IDA_MIGEMO => {
+            state.migemo_enabled = !state.migemo_enabled;
+            if state.migemo_enabled { state.regex_enabled = false; }
+            update_ui_states(state);
+            trigger_search(window);
+        }
         // --- メニュー項目 ---
         IDM_FILE_EXIT => {
             let _ = unsafe { DestroyWindow(window) };
@@ -824,12 +869,12 @@ fn create_menu(window: HWND) {
     unsafe {
         let h_menu = CreateMenu().unwrap();
         let h_file_submenu = CreatePopupMenu().unwrap();
-        let _ = AppendMenuW(h_file_submenu, MF_STRING, IDM_FILE_EXIT as usize, w!("終了(&X)\tAlt+F4"));
+        let _ = AppendMenuW(h_file_submenu, MF_STRING, IDM_FILE_EXIT as usize, w!("終了(&E)\tCtrl+Q"));
         let _ = AppendMenuW(h_menu, MF_POPUP, h_file_submenu.0 as usize, w!("ファイル(&F)"));
 
         let h_search_submenu = CreatePopupMenu().unwrap();
-        let _ = AppendMenuW(h_search_submenu, MF_STRING, IDM_SEARCH_REGEX as usize, w!("正規表現で検索(&R)"));
-        let _ = AppendMenuW(h_search_submenu, MF_STRING, IDM_SEARCH_MIGEMO as usize, w!("Migemoで検索(&M)"));
+        let _ = AppendMenuW(h_search_submenu, MF_STRING, IDM_SEARCH_REGEX as usize, w!("正規表現で検索\tCtrl+R"));
+        let _ = AppendMenuW(h_search_submenu, MF_STRING, IDM_SEARCH_MIGEMO as usize, w!("Migemoで検索\tCtrl+Shift+R"));
         let _ = AppendMenuW(h_menu, MF_POPUP, h_search_submenu.0 as usize, w!("検索(&S)"));
         let _ = SetMenu(window, Some(h_menu));
     }
