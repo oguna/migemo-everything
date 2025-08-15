@@ -102,6 +102,12 @@ pub struct AppState {
     pub migemo_dict: Option<CompactDictionary>,
     pub search_results: Mutex<Vec<FileResult>>,
 
+    // --- 仮想リストビュー関連 ---
+    pub total_results: u32,
+    pub current_search_term: String,
+    pub page_size: usize,
+    pub current_page_offset: usize, // 現在ロードされているページの開始オフセット
+
     // --- その他 ---
     // LVN_GETDISPINFOで使うための静的バッファ
     pub item_wide_buffer: [Vec<u16>; 4],
@@ -125,6 +131,10 @@ impl AppState {
             migemo_enabled: false,
             migemo_dict,
             search_results: Mutex::new(Vec::new()),
+            total_results: 0,
+            current_search_term: String::new(),
+            page_size: 100,  // 一度に読み込む件数（初回検索の件数と一致）
+            current_page_offset: 0,
             item_wide_buffer: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         }
     }
@@ -321,8 +331,10 @@ fn handle_command(window: HWND, wparam: WPARAM, lparam: LPARAM, state: &mut AppS
         // --- コンテキストメニュー ---
         IDM_CONTEXT_OPEN => {
             let item_index = lparam.0 as usize;
+            ensure_data_available(state, item_index);
             let results = state.search_results.lock().unwrap();
-            if let Some(result) = results.get(item_index) {
+            let local_index = item_index - state.current_page_offset;
+            if let Some(result) = results.get(local_index) {
                 let full_path = Path::new(&result.path).join(&result.name);
                 let path_w = str_to_wide(full_path.to_str().unwrap_or(""));
                 thread::spawn(move || unsafe {
@@ -332,8 +344,10 @@ fn handle_command(window: HWND, wparam: WPARAM, lparam: LPARAM, state: &mut AppS
         }
         IDM_CONTEXT_OPEN_FOLDER => {
             let item_index = lparam.0 as usize;
+            ensure_data_available(state, item_index);
             let results = state.search_results.lock().unwrap();
-            if let Some(result) = results.get(item_index) {
+            let local_index = item_index - state.current_page_offset;
+            if let Some(result) = results.get(local_index) {
                 let full_path = Path::new(&result.path).join(&result.name);
                 let params = format!("/select,\"{}\"", full_path.display());
                 let params_w = str_to_wide(&params);
@@ -347,8 +361,10 @@ fn handle_command(window: HWND, wparam: WPARAM, lparam: LPARAM, state: &mut AppS
         }
         IDM_CONTEXT_COPY_PATH => {
             let item_index = lparam.0 as usize;
+            ensure_data_available(state, item_index);
             let results = state.search_results.lock().unwrap();
-            if let Some(result) = results.get(item_index) {
+            let local_index = item_index - state.current_page_offset;
+            if let Some(result) = results.get(local_index) {
                 let full_path_str = Path::new(&result.path)
                     .join(&result.name)
                     .to_str().unwrap_or("").to_string();
@@ -450,8 +466,15 @@ fn handle_get_disp_info(lparam: LPARAM, state: &mut AppState) {
     let item = &mut dispinfo.item;
     let item_index = item.iItem as usize;
 
+    // 必要に応じてデータを読み込む
+    ensure_data_available(state, item_index);
+
     let results = state.search_results.lock().unwrap();
-    if let Some(result) = results.get(item_index) {
+    
+    // ローカルインデックスを計算（現在のページ内での位置）
+    let local_index = item_index - state.current_page_offset;
+    
+    if let Some(result) = results.get(local_index) {
         // テキスト情報
         if (item.mask & LVIF_TEXT) == LVIF_TEXT {
             let sub_item_index = item.iSubItem as usize;
@@ -500,8 +523,15 @@ fn handle_custom_draw(lparam: LPARAM, state: &mut AppState) -> LRESULT {
             let item_index = custom_draw.nmcd.dwItemSpec as usize;
             let sub_item_index = custom_draw.iSubItem as usize;
 
+            // 必要に応じてデータを読み込む
+            ensure_data_available(state, item_index);
+
             let results = state.search_results.lock().unwrap();
-            if let Some(result) = results.get(item_index) {
+            
+            // ローカルインデックスを計算
+            let local_index = item_index - state.current_page_offset;
+            
+            if let Some(result) = results.get(local_index) {
                 // ハイライト対象の文字列と、そのプレーンテキスト/ハイライト範囲を取得
                 let (text_to_draw, highlight_ranges) = match sub_item_index {
                     0 if !result.highlighted_name.is_empty() => {
@@ -878,6 +908,9 @@ fn perform_search(state: &mut AppState) {
 
     if search_term.is_empty() {
         state.search_results.lock().unwrap().clear();
+        state.total_results = 0;
+        state.current_search_term.clear();
+        state.current_page_offset = 0;
         unsafe {
             let _ = SetWindowTextW(state.status_hwnd, w!("Ready"));
             SendMessageW(state.listview_hwnd, LVM_SETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
@@ -886,12 +919,20 @@ fn perform_search(state: &mut AppState) {
         return;
     }
 
-    let mut guard = global().lock().unwrap();
-    let mut searcher = guard.searcher();
     let final_search_term = if state.migemo_enabled {
         migemo_query(&search_term, &state.migemo_dict).unwrap_or(search_term)
     } else { search_term };
 
+    // 検索クエリが変わった場合のみキャッシュをクリア
+    if state.current_search_term != final_search_term {
+        state.search_results.lock().unwrap().clear();
+        state.current_search_term = final_search_term.clone();
+        state.current_page_offset = 0; // ページオフセットもリセット
+    }
+
+    let mut guard = global().lock().unwrap();
+    let mut searcher = guard.searcher();
+    
     searcher.set_search(&final_search_term);
     searcher.set_regex(state.regex_enabled || state.migemo_enabled);
     searcher.set_request_flags(
@@ -904,15 +945,14 @@ fn perform_search(state: &mut AppState) {
         RequestFlags::EVERYTHING_REQUEST_HIGHLIGHTED_PATH
     );
 
-    // クエリを実行し、結果オブジェクトを保持する
-    let query_results = searcher.query();
-    //  APIから合計件数を取得する
-    let total_results = query_results.total();
+    // 初回検索時は最初の100件を取得（高速化のため）
+    let query_results = searcher.set_max(100).query();
+    state.total_results = query_results.total();
 
-    let mut new_results = Vec::new();
-    const MAX_DISPLAY_COUNT: usize = 10000;
-    for item in query_results.iter().take(MAX_DISPLAY_COUNT) {
-        new_results.push(FileResult {
+    // 最初の100件のデータを取得してキャッシュに保存
+    let mut initial_results = Vec::new();
+    for item in query_results.iter() {
+        initial_results.push(FileResult {
             name: item.filename().unwrap_or_default().to_string_lossy().to_string(),
             path: item.path().unwrap_or_default().to_string_lossy().to_string(),
             size: item.size().unwrap_or(0),
@@ -923,25 +963,79 @@ fn perform_search(state: &mut AppState) {
         });
     }
 
-    let displayed_count = new_results.len();
-    *state.search_results.lock().unwrap() = new_results;
+    // 最初のページ（オフセット0）としてキャッシュに保存
+    state.current_page_offset = 0;
+    *state.search_results.lock().unwrap() = initial_results;
 
-    // ステータスバーのテキストを、総件数と表示件数に応じて変更
-    let status_text = if total_results > displayed_count as u32 {
-        format!(
-            "Showing {} of {} items",
-            displayed_count, total_results
-        )
-    } else {
-        format!("{} items found", total_results)
-    };
-
+    // ステータスバーの更新
+    let status_text = format!("{} items found", state.total_results);
     unsafe {
         let _ = SetWindowTextW(state.status_hwnd, PCWSTR(str_to_wide(&status_text).as_ptr()));
-        // ListViewにセットする件数は表示件数(displayed_count)のまま
-        SendMessageW(state.listview_hwnd, LVM_SETITEMCOUNT, Some(WPARAM(displayed_count)), Some(LPARAM(0)));
+        // ListViewの総件数を設定
+        SendMessageW(state.listview_hwnd, LVM_SETITEMCOUNT, Some(WPARAM(state.total_results as usize)), Some(LPARAM(0)));
         let _ = InvalidateRect(Some(state.listview_hwnd), None, true);
     }
+}
+
+/// 指定されたアイテムインデックスのデータが利用可能かを確認し、必要に応じて読み込む
+fn ensure_data_available(state: &mut AppState, item_index: usize) {
+    if state.current_search_term.is_empty() { return; }
+    
+    let page_start = (item_index / state.page_size) * state.page_size;
+    
+    // 現在ロードされているページと一致するかチェック
+    if state.current_page_offset == page_start {
+        let results = state.search_results.lock().unwrap();
+        let local_index = item_index - page_start;
+        if local_index < results.len() {
+            // 既にデータが存在する
+            return;
+        }
+    }
+    
+    // 新しいページを読み込む（初回の100件と重複していてもload_pageで処理）
+    load_page(state, page_start);
+}
+
+/// 指定されたオフセットからページサイズ分のデータを読み込む
+fn load_page(state: &mut AppState, offset: usize) {
+    if state.current_search_term.is_empty() { return; }
+    
+    let mut guard = global().lock().unwrap();
+    let mut searcher = guard.searcher();
+    
+    searcher.set_search(&state.current_search_term);
+    searcher.set_regex(state.regex_enabled || state.migemo_enabled);
+    searcher.set_offset(offset as u32);
+    searcher.set_max(state.page_size as u32);
+    searcher.set_request_flags(
+        RequestFlags::EVERYTHING_REQUEST_FILE_NAME |
+        RequestFlags::EVERYTHING_REQUEST_PATH |
+        RequestFlags::EVERYTHING_REQUEST_SIZE |
+        RequestFlags::EVERYTHING_REQUEST_DATE_MODIFIED |
+        RequestFlags::EVERYTHING_REQUEST_ATTRIBUTES |
+        RequestFlags::EVERYTHING_REQUEST_HIGHLIGHTED_FILE_NAME |
+        RequestFlags::EVERYTHING_REQUEST_HIGHLIGHTED_PATH
+    );
+
+    let query_results = searcher.query();
+    let mut new_results = Vec::new();
+    
+    for item in query_results.iter() {
+        new_results.push(FileResult {
+            name: item.filename().unwrap_or_default().to_string_lossy().to_string(),
+            path: item.path().unwrap_or_default().to_string_lossy().to_string(),
+            size: item.size().unwrap_or(0),
+            modified_date: item.date_modified().unwrap_or(0),
+            highlighted_name: item.highlighted_filename().unwrap_or_default().to_string_lossy().to_string(),
+            highlighted_path: item.highlighted_path().unwrap_or_default().to_string_lossy().to_string(),
+            is_folder: item.is_folder(),
+        });
+    }
+    
+    // 現在のページ情報を更新
+    state.current_page_offset = offset;
+    *state.search_results.lock().unwrap() = new_results;
 }
 
 // --- ユーティリティ関数 ---
