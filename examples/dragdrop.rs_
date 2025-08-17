@@ -1,14 +1,15 @@
-// main.rs
+// main.rs (dragdrop.rs)
 
 // Cargo.toml に以下を追加してください:
 // [dependencies.windows]
-// version = "0.61.0" // Or a newer version
+// version = "0.56.0"
 // features = [
 //     "Win32_Foundation",
 //     "Win32_Graphics_Gdi",
 //     "Win32_System_Com",
 //     "Win32_System_LibraryLoader",
 //     "Win32_System_Memory",
+//     "Win32_System_Ole", // OLE (ドラッグ&ドロップ) のために追加
 //     "Win32_System_SystemServices",
 //     "Win32_UI_Controls",
 //     "Win32_UI_Shell",
@@ -22,22 +23,22 @@ use std::path::Path;
 use windows::{
     core::*,
     Win32::{
+        Foundation::{DRAGDROP_S_DROP, DRAGDROP_S_CANCEL},
         Foundation::*,
-        Graphics::Gdi::ClientToScreen,
         System::{
             Com::{
                 CoInitializeEx, CoUninitialize, CoTaskMemFree,
                 COINIT_APARTMENTTHREADED,
             },
             LibraryLoader::GetModuleHandleW,
-            SystemServices::SFGAO_FILESYSTEM,
+            Ole::{DoDragDrop, IDropSource, IDropSource_Impl, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE},
+            SystemServices::{SFGAO_FILESYSTEM, MK_LBUTTON, MODIFIERKEYS_FLAGS},
         },
         UI::{
             Controls::*,
             Shell::{
                 Common::ITEMIDLIST,
-                SHBindToParent, SHParseDisplayName, CMINVOKECOMMANDINFO, IContextMenu,
-                IShellFolder, CMF_NORMAL,
+                SHBindToParent, SHParseDisplayName, IShellFolder, SHCreateDataObject,
             },
             WindowsAndMessaging::*,
         },
@@ -45,8 +46,6 @@ use windows::{
 };
 
 const ID_LISTVIEW: isize = 1000;
-// カスタムメニューアイテムのコマンドID
-const IDM_CUSTOM_COMMAND: u32 = 0x8000;
 
 fn main() -> Result<()> {
     // 1. COMライブラリの初期化
@@ -55,7 +54,7 @@ fn main() -> Result<()> {
     }
 
     let instance = unsafe { GetModuleHandleW(None)? };
-    let window_class_name = w!("ExplorerContextMenuSample");
+    let window_class_name = w!("DragDropSample");
 
     let wc = WNDCLASSW {
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
@@ -75,7 +74,7 @@ fn main() -> Result<()> {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             window_class_name,
-            w!("Rust Explorer Context Menu"),
+            w!("Rust Drag Drop Sample"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -94,7 +93,6 @@ fn main() -> Result<()> {
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
         unsafe {
-            // 警告を解消するために戻り値を無視
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -133,16 +131,10 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
             WM_NOTIFY => {
                 let nmhdr: &NMHDR = &*(lparam.0 as *const NMHDR);
                 if nmhdr.idFrom as isize == ID_LISTVIEW {
-                    if nmhdr.code == NM_RCLICK {
-                        let nmitem: &NMITEMACTIVATE = &*(lparam.0 as *const NMITEMACTIVATE);
-                        if nmitem.iItem != -1 {
-                            show_context_menu(
-                                window,
-                                nmhdr.hwndFrom,
-                                nmitem.iItem,
-                                nmitem.ptAction,
-                            );
-                        }
+                    // ドラッグ開始の通知を処理
+                    if nmhdr.code == LVN_BEGINDRAG {
+                        let nmlistview: &NMLISTVIEW = &*(lparam.0 as *const NMLISTVIEW);
+                        handle_drag_begin(nmhdr.hwndFrom, nmlistview.iItem);
                     }
                 }
                 LRESULT(0)
@@ -163,7 +155,6 @@ fn create_listview(parent: HWND, instance: HINSTANCE) -> Result<()> {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_LISTVIEW_CLASSES,
         };
-        // 警告を解消するために戻り値を無視
         let _ = InitCommonControlsEx(&icex);
 
         let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(LVS_REPORT) | WINDOW_STYLE(LVS_SINGLESEL);
@@ -210,7 +201,6 @@ fn populate_listview(listview_hwnd: HWND) -> Result<()> {
         let entry = entry.unwrap();
         let path = entry.path();
         let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-
         let mut item_text: Vec<u16> = OsStr::new(&*file_name).encode_wide().chain(Some(0)).collect();
 
         let item = LVITEMW {
@@ -233,8 +223,13 @@ fn populate_listview(listview_hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
-// コンテキストメニューを表示するメインの関数
-fn show_context_menu(owner: HWND, listview_hwnd: HWND, item_index: i32, point: POINT) {
+// ドラッグ開始を処理する関数
+fn handle_drag_begin(listview_hwnd: HWND, item_index: i32) {
+    if item_index < 0 {
+        return;
+    }
+
+    // 1. ドラッグされるアイテムのフルパスを取得
     let mut text_buffer: [u16; MAX_PATH as usize] = [0; MAX_PATH as usize];
     let mut item = LVITEMW {
         mask: LVIF_TEXT,
@@ -257,85 +252,36 @@ fn show_context_menu(owner: HWND, listview_hwnd: HWND, item_index: i32, point: P
     let current_dir = std::env::current_dir().unwrap();
     let full_path = current_dir.join(&file_name);
 
-    // _pidl_absolute で所有権を持つことで、pidl_relative が指すメモリの生存期間を保証する
+    // 2. IDataObject を作成
+    // ファイルのPIDLから、Shellは標準的なIDataObject（CF_HDROP形式のデータを持つ）を作成してくれる
     if let Ok((shell_folder, _pidl_absolute, pidl_relative)) = get_shell_folder_and_pidl(&full_path) {
-        let context_menu: Result<IContextMenu> =
-            unsafe { shell_folder.GetUIObjectOf(owner, &[pidl_relative], None) };
+        let data_object = unsafe {
+            SHCreateDataObject(Some(shell_folder.cast().unwrap()), &[pidl_relative], None)
+        };
 
-        if let Ok(context_menu) = context_menu {
-            let hmenu = unsafe { CreatePopupMenu().unwrap() };
+        if let Ok(data_object) = data_object {
+            // 3. IDropSource を作成
+            let drop_source: IDropSource = DropSource::new().into();
+            let mut effect = DROPEFFECT_NONE;
 
-            if unsafe { context_menu.QueryContextMenu(hmenu, 0, 1, 0x7FFF, CMF_NORMAL) }.is_ok() {
-                unsafe {
-                    let item_count = GetMenuItemCount(Some(hmenu));
-                    InsertMenuW(
-                        hmenu,
-                        item_count as u32,
-                        MF_BYPOSITION | MF_SEPARATOR,
-                        0,
-                        None,
-                    )
-                    .unwrap();
+            // 4. DoDragDrop を呼び出してドラッグ&ドロップ操作を開始
+            let result = unsafe {
+                DoDragDrop(&data_object, &drop_source, DROPEFFECT_COPY, &mut effect)
+            };
 
-                    let menu_text: Vec<u16> =
-                        OsStr::new("カスタムアクション(&C)").encode_wide().chain(Some(0)).collect();
-                    InsertMenuW(
-                        hmenu,
-                        (item_count + 1) as u32,
-                        MF_BYPOSITION | MF_STRING,
-                        IDM_CUSTOM_COMMAND as usize,
-                        PCWSTR(menu_text.as_ptr()),
-                    )
-                    .unwrap();
-                }
-
-                let mut pt = point;
-                unsafe { ClientToScreen(listview_hwnd, &mut pt).unwrap() };
-
-                let cmd = unsafe {
-                    TrackPopupMenuEx(hmenu, TPM_RETURNCMD.0, pt.x, pt.y, owner, None)
-                };
-
-                let cmd_u32 = cmd.0 as u32;
-                if cmd_u32 > 0 {
-                    if cmd_u32 == IDM_CUSTOM_COMMAND {
-                        let message =
-                            format!("カスタムアクションがファイル「{}」に対して実行されました。", file_name);
-                        let title = "カスタムコマンド";
-                        let message_w: Vec<u16> =
-                            OsStr::new(&message).encode_wide().chain(Some(0)).collect();
-                        let title_w: Vec<u16> =
-                            OsStr::new(title).encode_wide().chain(Some(0)).collect();
-
-                        unsafe {
-                            MessageBoxW(
-                                Some(owner),
-                                PCWSTR(message_w.as_ptr()),
-                                PCWSTR(title_w.as_ptr()),
-                                MB_OK | MB_ICONINFORMATION,
-                            );
-                        }
-                    } else if cmd_u32 <= 0x7FFF {
-                        let ci = CMINVOKECOMMANDINFO {
-                            cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
-                            hwnd: owner,
-                            lpVerb: PCSTR::from_raw((cmd_u32 - 1) as *const u8),
-                            nShow: SW_SHOWNORMAL.0 as i32,
-                            ..Default::default()
-                        };
-
-                        if let Err(e) = unsafe { context_menu.InvokeCommand(&ci) } {
-                            eprintln!("InvokeCommand failed: {:?}", e);
-                        }
-                    }
-                }
+            // 結果のハンドリング（任意）
+            if result == DRAGDROP_S_DROP {
+                println!("Dropped with effect: {:?}", effect);
+            } else if result == DRAGDROP_S_CANCEL {
+                println!("Drag canceled");
+            } else {
+                println!("Drag failed with error: {:?}", result);
             }
-            unsafe { DestroyMenu(hmenu).unwrap() };
         }
     }
 }
 
-// 戻り値を変更: 所有権を持つ絶対PIDLと、それへのポインタである相対PIDLを返す
+// ファイルパスから IShellFolder と相対 PIDL を取得するヘルパー関数
 fn get_shell_folder_and_pidl(path: &Path) -> Result<(IShellFolder, OwningPidl, *const ITEMIDLIST)> {
     let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut pidl_absolute = OwningPidl::new();
@@ -351,9 +297,7 @@ fn get_shell_folder_and_pidl(path: &Path) -> Result<(IShellFolder, OwningPidl, *
         )?;
     }
 
-    // SHBindToParent が書き込むポインタなので *mut ITEMIDLIST に変更
     let mut pidl_relative_ptr: *mut ITEMIDLIST = std::ptr::null_mut();
-
     let shell_folder: IShellFolder = unsafe {
         SHBindToParent(
             pidl_absolute.as_ptr(),
@@ -364,25 +308,15 @@ fn get_shell_folder_and_pidl(path: &Path) -> Result<(IShellFolder, OwningPidl, *
     Ok((shell_folder, pidl_absolute, pidl_relative_ptr))
 }
 
-// メモリ解放の責務を持つことを明確にするために名前を変更
+// PIDLのメモリを管理するためのラッパ構造体
 struct OwningPidl {
     ptr: *mut ITEMIDLIST,
 }
 
 impl OwningPidl {
-    fn new() -> Self {
-        Self {
-            ptr: std::ptr::null_mut(),
-        }
-    }
-
-    fn as_ptr(&self) -> *const ITEMIDLIST {
-        self.ptr
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut *mut ITEMIDLIST {
-        &mut self.ptr
-    }
+    fn new() -> Self { Self { ptr: std::ptr::null_mut() } }
+    fn as_ptr(&self) -> *const ITEMIDLIST { self.ptr }
+    fn as_mut_ptr(&mut self) -> *mut *mut ITEMIDLIST { &mut self.ptr }
 }
 
 impl Drop for OwningPidl {
@@ -390,5 +324,39 @@ impl Drop for OwningPidl {
         if !self.ptr.is_null() {
             unsafe { CoTaskMemFree(Some(self.ptr as *const _)) };
         }
+    }
+}
+
+
+// IDropSourceインターフェースの実装
+#[implement(IDropSource)]
+struct DropSource;
+
+impl DropSource {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[allow(non_snake_case)]
+impl IDropSource_Impl for DropSource {
+    // ドラッグ中に定期的に呼び出される
+    fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
+        // Escキーが押されたらキャンセル
+        if fescapepressed.as_bool() {
+            return DRAGDROP_S_CANCEL;
+        }
+        // 左マウスボタンが離されたらドロップ
+        if (grfkeystate & MK_LBUTTON) == 0 {
+            return DRAGDROP_S_DROP;
+        }
+        // それ以外の場合はドラッグを継続
+        S_OK
+    }
+
+    // カーソルのフィードバックを与えるために呼び出される
+    fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
+        // Windowsにデフォルトのカーソルを使用させる
+        DRAGDROP_S_USEDEFAULTCURSORS
     }
 }
