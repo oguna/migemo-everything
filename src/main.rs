@@ -135,7 +135,7 @@ impl AppState {
             current_dpi: 96,  // デフォルトDPI
             scale_factor: 1.0,  // デフォルトスケール
             regex_enabled: false,
-            migemo_enabled: false,
+            migemo_enabled: true,
             migemo_dict,
             search_results: Mutex::new(Vec::new()),
             total_results: 0,
@@ -976,6 +976,10 @@ fn setup_listview(state: &mut AppState) {
                 cx: *width,
                 pszText: PWSTR(text.as_ptr() as *mut _), ..Default::default()
             };
+            if i == 2 {
+                col.mask |= LVCF_FMT;
+                col.fmt = LVCFMT_RIGHT;
+            }
             SendMessageW(state.listview_hwnd, LVM_INSERTCOLUMNW, Some(WPARAM(i)), Some(LPARAM(&mut col as *mut _ as isize)));
         }
     }
@@ -1258,14 +1262,37 @@ fn get_icon_index(name: &str, is_folder: bool, himagelist: HIMAGELIST) -> i32 {
     shfi.iIcon
 }
 
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut result = Vec::new();
+    let len = bytes.len();
+    let first = len % 3;
+
+    if first > 0 {
+        result.extend_from_slice(&bytes[..first]);
+        if len > first {
+            result.push(b',');
+        }
+    }
+
+    for (i, chunk) in bytes[first..].chunks(3).enumerate() {
+        result.extend_from_slice(chunk);
+        if i < (len - first) / 3 - 1 {
+            result.push(b',');
+        }
+    }
+    String::from_utf8(result).unwrap_or_default()
+}
+
 /// ファイルサイズをKB単位の文字列にフォーマットする
 fn format_size(bytes: u64) -> String {
     if bytes == 0 { return "".to_string(); }
     let kb = (bytes + 1023) / 1024;
-    format!("{} KB", kb)
+    format!("{} KB", format_with_commas(kb))
 }
 
-/// FILETIME(u64)を"YYYY-MM-DD HH:MM:SS"形式の文字列に変換する
+/// FILETIME(u64)を"YYYY-MM-DD HH:MM"形式の文字列に変換する
 fn format_date(filetime: u64) -> String {
     if filetime == 0 { return String::new(); }
     let ft = FILETIME {
@@ -1275,8 +1302,8 @@ fn format_date(filetime: u64) -> String {
     let mut st = SYSTEMTIME::default();
     if unsafe { FileTimeToSystemTime(&ft, &mut st).is_ok() } {
         format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
         )
     } else {
         String::new()
