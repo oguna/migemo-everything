@@ -66,7 +66,7 @@ const IDA_MIGEMO: u16 = 5003;
 
 /// コンテキストメニューID: 開く
 const IDM_CONTEXT_OPEN: u16 = 4001;
-/// コンテキストメニューID: フォルダーを開く
+/// コンテキストメニューID: フォルダを開く
 const IDM_CONTEXT_OPEN_FOLDER: u16 = 4002;
 /// コンテキストメニューID: フルパスをコピー
 const IDM_CONTEXT_COPY_PATH: u16 = 4003;
@@ -836,7 +836,7 @@ fn handle_right_click(window: HWND, lparam: LPARAM) {
         unsafe {
             let h_popup_menu = CreatePopupMenu().unwrap();
             let _ = AppendMenuW(h_popup_menu, MF_STRING, IDM_CONTEXT_OPEN as usize, w!("開く(&O)"));
-            let _ = AppendMenuW(h_popup_menu, MF_STRING, IDM_CONTEXT_OPEN_FOLDER as usize, w!("フォルダーを開く(&F)"));
+            let _ = AppendMenuW(h_popup_menu, MF_STRING, IDM_CONTEXT_OPEN_FOLDER as usize, w!("フォルダを開く(&F)"));
             let _ = AppendMenuW(h_popup_menu, MF_STRING, IDM_CONTEXT_COPY_PATH as usize, w!("フルパスをコピー(&C)"));
             let _ = SetMenuDefaultItem(h_popup_menu, IDM_CONTEXT_OPEN as u32, 0);
 
@@ -965,7 +965,7 @@ fn setup_listview(state: &mut AppState) {
         let scale = state.scale_factor;
         let columns = [
             (w!("名前"), (300.0 * scale) as i32),
-            (w!("フォルダー"), (300.0 * scale) as i32),
+            (w!("フォルダ"), (300.0 * scale) as i32),
             (w!("サイズ"), (80.0 * scale) as i32),
             (w!("更新日時"), (150.0 * scale) as i32)
         ];
