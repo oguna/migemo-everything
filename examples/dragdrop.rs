@@ -57,12 +57,9 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let atom = unsafe { RegisterClassW(&wc) };
-    if atom == 0 {
-        return Err(Error::from_win32());
-    }
+    let _atom = unsafe { RegisterClassW(&wc) };
 
-    let hwnd = unsafe {
+    let _hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             window_class_name,
@@ -78,9 +75,6 @@ fn main() -> Result<()> {
             None,
         )
     }?;
-    if hwnd.is_invalid() {
-        return Err(Error::from_win32());
-    }
 
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
@@ -246,3 +240,4 @@ fn handle_drag_begin(listview_hwnd: HWND, item_index: i32) {
     // 簡略化: 実際のドラッグ&ドロップはここでは省略
     // 完全な実装にはより複雑なCOM操作が必要
 }
+
