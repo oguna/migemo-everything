@@ -24,7 +24,7 @@ use windows::{
     },
     Win32::UI::Input::KeyboardAndMouse::SetFocus,
     Win32::UI::Shell::{
-        Common::ITEMIDLIST, ShellExecuteW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON,
+        Common::ITEMIDLIST, ShellExecuteW, SHFILEINFOW, SHGFI_SMALLICON,
         SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHBindToParent,
         SHParseDisplayName, CMINVOKECOMMANDINFO, CMF_NORMAL, IContextMenu, IShellFolder,
     },
@@ -258,20 +258,34 @@ pub extern "system" fn wndproc(
         Some(unsafe { &mut *app_state_ptr })
     };
 
+    let default_proc = || unsafe { DefWindowProcW(window, message, wparam, lparam) };
+
+    let Some(state) = state else {
+        return match message {
+            WM_CREATE => handle_create(window, lparam),
+            WM_DESTROY => handle_destroy(window),
+            WM_PAINT => {
+                let _ = unsafe { ValidateRect(Some(window), None) };
+                LRESULT(0)
+            }
+            _ => default_proc(),
+        };
+    };
+
     match message {
         WM_CREATE => handle_create(window, lparam),
         WM_DESTROY => handle_destroy(window),
-        WM_COMMAND => handle_command(window, wparam, lparam, state.unwrap()),
-        WM_TIMER => handle_timer(window, wparam, state.unwrap()),
-        WM_NOTIFY => handle_notify(window, lparam, state.unwrap()),
-        WM_SIZE => handle_size(window, lparam, state.unwrap()),
-        WM_SETFOCUS => handle_setfocus(state.unwrap()),
-        WM_DPICHANGED => handle_dpi_changed(window, wparam, lparam, state.unwrap()),
+        WM_COMMAND => handle_command(window, wparam, lparam, state),
+        WM_TIMER => handle_timer(window, wparam, state),
+        WM_NOTIFY => handle_notify(window, lparam, state),
+        WM_SIZE => handle_size(window, lparam, state),
+        WM_SETFOCUS => handle_setfocus(state),
+        WM_DPICHANGED => handle_dpi_changed(window, wparam, lparam, state),
         WM_PAINT => {
             let _ = unsafe { ValidateRect(Some(window), None) };
             LRESULT(0)
         }
-        _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        _ => default_proc(),
     }
 }
 
@@ -1127,7 +1141,7 @@ fn parse_highlight_text(highlighted_text: &str) -> (String, Vec<(usize, usize)>)
 fn get_icon_index(name: &str, is_folder: bool, himagelist: HIMAGELIST) -> i32 {
     let mut shfi: SHFILEINFOW = unsafe { std::mem::zeroed() };
     let file_name_w = str_to_wide(name);
-    let mut flags = SHGFI_ICON | SHGFI_USEFILEATTRIBUTES;
+    let mut flags = SHGFI_USEFILEATTRIBUTES;
     if himagelist.0 != 0 { flags |= SHGFI_SYSICONINDEX; }
     let attr = if is_folder { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
 
